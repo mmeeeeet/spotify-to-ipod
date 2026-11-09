@@ -112,7 +112,7 @@ def page_items_and_next(data):
 
 def collect_tracks(uri):
     """Fetch every track of a playlist, following pagination.
-    Returns (playlist_name, [ {title, artist, spotify_uri} ])."""
+    Returns (playlist_name, [ {title, artist, spotify_uri, duration_ms} ])."""
     data = spotify_call(["experience", "--id", uri])
     playlist_name = data.get("title") or "playlist"
     items, next_url = page_items_and_next(data)
@@ -131,7 +131,12 @@ def collect_tracks(uri):
         title = (item.get("title") or "").strip()
         artist = (item.get("subtitle") or "").strip()
         if title:
-            tracks.append({"title": title, "artist": artist, "spotify_uri": uri_i})
+            tracks.append({
+                "title": title,
+                "artist": artist,
+                "spotify_uri": uri_i,
+                "duration_ms": item.get("duration_ms"),
+            })
     return playlist_name, tracks
 
 
@@ -177,28 +182,197 @@ def tag_mp3(path, title, artist, track_no):
     tags.save(path)
 
 
-def download_track(ytdlp, track, dest_path, tmp_dir):
-    """Download one track as MP3 to dest_path. Returns (ok, query, error)."""
-    query = "ytsearch1:%s - %s" % (track["artist"], track["title"])
-    outtmpl = os.path.join(tmp_dir, "dl.%(ext)s")
+BOT_CLIENTS = ["android", "tv", "ios"]
+
+
+def is_bot_wall(text):
+    """True when yt-dlp's error output is YouTube's sign-in / bot check."""
+    t = (text or "").lower()
+    return "not a bot" in t or "sign in to confirm" in t
+
+
+def probe_duration(path):
+    """Real duration of an audio file in seconds (ffprobe), or None."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        return float((proc.stdout or "").strip())
+    except Exception:
+        return None
+
+
+def audio_hash(path):
+    """MD5 hash of the decoded audio stream, or None."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-map", "0:a",
+             "-f", "hash", "-hash", "md5", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        m = re.search(r"MD5=([0-9a-fA-F]+)", proc.stdout or "")
+        return m.group(1).lower() if m else None
+    except Exception:
+        return None
+
+
+def duration_ok(file_secs, spotify_secs):
+    """Accept when the file's length is within max(8s, 4%) of Spotify's."""
+    tolerance = max(8.0, 0.04 * spotify_secs)
+    return abs(file_secs - spotify_secs) <= tolerance
+
+
+def _download_once(ytdlp, url, outtmpl, extra_args):
+    """One yt-dlp download attempt. Returns (ok, stderr_text)."""
     cmd = [
         ytdlp,
         "-f", "bestaudio/best",
         "--extract-audio", "--audio-format", "mp3", "--audio-quality", "192K",
         "--no-playlist", "--no-warnings", "--quiet", "--no-progress",
-        "-o", outtmpl,
-        query,
     ]
+    if extra_args:
+        cmd += extra_args
+    cmd += ["-o", outtmpl, url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
-        return False, query, "yt-dlp timed out after 600s"
-    produced = os.path.join(tmp_dir, "dl.mp3")
-    if proc.returncode != 0 or not os.path.isfile(produced):
-        err = (proc.stderr or "").strip().splitlines()
-        return False, query, err[-1] if err else "yt-dlp exit %d" % proc.returncode
-    shutil.move(produced, dest_path)
-    return True, query, None
+        return False, "yt-dlp timed out after 600s"
+    return proc.returncode == 0, (proc.stderr or "")
+
+
+def download_candidate(ytdlp, video_id, tmp_base):
+    """Download one YouTube video as MP3 next to tmp_base.
+    When YouTube throws its bot/sign-in wall, retry through the android,
+    tv and ios player clients in that order.
+    Returns (produced_path_or_None, error_or_None)."""
+    url = "https://www.youtube.com/watch?v=%s" % video_id
+    outtmpl = tmp_base + ".%(ext)s"
+    produced = tmp_base + ".mp3"
+    attempts = [None] + BOT_CLIENTS
+    last_err = None
+    for idx, client in enumerate(attempts):
+        extra = None
+        if client:
+            extra = ["--extractor-args", "youtube:player_client=%s" % client]
+        ok, stderr = _download_once(ytdlp, url, outtmpl, extra)
+        if ok and os.path.isfile(produced):
+            return produced, None
+        err_lines = (stderr or "").strip().splitlines()
+        last_err = err_lines[-1] if err_lines else "yt-dlp download failed"
+        if os.path.isfile(produced):
+            os.remove(produced)
+        # Only the bot wall earns the player-client fallback chain.
+        if idx == 0 and not is_bot_wall(stderr):
+            break
+    return None, last_err
+
+
+def search_candidates(ytdlp, search, limit=3):
+    """List up to `limit` YouTube video ids for a search string.
+    The bot-wall client fallback applies to the listing too.
+    Returns (ids, error_or_None)."""
+    attempts = [None] + BOT_CLIENTS
+    last_err = None
+    for client in attempts:
+        cmd = [ytdlp, "--flat-playlist", "--no-warnings", "--quiet",
+               "--print", "id"]
+        if client:
+            cmd += ["--extractor-args", "youtube:player_client=%s" % client]
+        cmd.append(search)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return [], "yt-dlp search timed out after 120s"
+        ids = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if ids:
+            return ids[:limit], None
+        err_lines = (proc.stderr or "").strip().splitlines()
+        last_err = err_lines[-1] if err_lines else "yt-dlp search exit %d" % proc.returncode
+        if not is_bot_wall(proc.stderr):
+            break
+    return [], last_err
+
+
+def query_variants(track):
+    """Search strings for a track, most specific first. YouTube search
+    silently returns zero results for some over-specified queries (long
+    featured-artist lists, feat. parentheticals), so fall back to
+    simpler forms before giving up."""
+    artist = track["artist"]
+    title = track["title"]
+    first_artist = artist.split(",")[0].strip()
+    bare_title = re.sub(r"\s*\((?:feat\.|ft\.)[^)]*\)\s*", " ", title,
+                        flags=re.I).strip()
+    variants = [
+        "%s - %s" % (artist, title),
+        "%s - %s" % (first_artist, bare_title),
+        "%s %s" % (first_artist, bare_title),
+    ]
+    out = []
+    for v in variants:
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def fetch_track(ytdlp, track, tmp_dir, seen_hashes):
+    """Walk the top YouTube candidates for one track, applying the guards:
+    a candidate is accepted only if its real duration matches Spotify's
+    (max(8s, 4%) tolerance) and its decoded-audio hash has not already
+    been accepted for another track in this run.
+    Returns a dict: {ok, path, query, spotify_secs, file_secs, hash, error}."""
+    spotify_secs = None
+    if track.get("duration_ms"):
+        spotify_secs = track["duration_ms"] / 1000.0
+
+    cand_ids, list_err, search = [], None, None
+    for q in query_variants(track):
+        cand_ids, list_err = search_candidates(ytdlp, "ytsearch3:%s" % q)
+        if cand_ids:
+            search = "ytsearch3:%s" % q
+            break
+    if not cand_ids:
+        return {"ok": False,
+                "query": "ytsearch3:%s" % query_variants(track)[0],
+                "error": list_err or "no YouTube candidates found"}
+
+    saw_download = False
+    saw_duration_pass = False
+    saw_dup = False
+    last_err = None
+    for cand_no, video_id in enumerate(cand_ids, 1):
+        tmp_base = os.path.join(tmp_dir, "cand%d" % cand_no)
+        produced, err = download_candidate(ytdlp, video_id, tmp_base)
+        if not produced:
+            last_err = err
+            continue
+        saw_download = True
+        file_secs = probe_duration(produced)
+        if spotify_secs is not None:
+            if file_secs is None or not duration_ok(file_secs, spotify_secs):
+                os.remove(produced)
+                continue
+            saw_duration_pass = True
+        h = audio_hash(produced)
+        if h is not None and h in seen_hashes:
+            saw_dup = True
+            os.remove(produced)
+            continue
+        return {"ok": True, "path": produced, "query": search,
+                "spotify_secs": spotify_secs, "file_secs": file_secs,
+                "hash": h, "error": None}
+
+    if not saw_download:
+        error = last_err or "download failed"
+    elif spotify_secs is not None and not saw_duration_pass:
+        error = "no match passed the duration check"
+    elif saw_dup:
+        error = "every candidate duplicated another track"
+    else:
+        error = last_err or "no usable candidate"
+    return {"ok": False, "query": search, "error": error}
 
 
 # --------------------------------------------------------------------------
@@ -253,6 +427,8 @@ def main(argv=None):
 
     width = max(2, len(str(len(tracks))))
     downloaded, skipped, failed = [], [], []
+    checks = []        # (label, spotify_secs, file_secs) per downloaded track
+    seen_hashes = {}   # decoded-audio hash -> label, for the duplicate guard
 
     for i, track in enumerate(tracks, 1):
         label = "%s - %s" % (track["artist"], track["title"])
@@ -260,14 +436,21 @@ def main(argv=None):
         dest = os.path.join(out_dir, fname)
         if os.path.isfile(dest) and os.path.getsize(dest) > 0:
             print("[%d/%d] skip (exists): %s" % (i, len(tracks), label), flush=True)
+            h = audio_hash(dest)
+            if h is not None and h not in seen_hashes:
+                seen_hashes[h] = label
             skipped.append(label)
             continue
         print("[%d/%d] downloading: %s" % (i, len(tracks), label), flush=True)
-        ok, query, err = download_track(ytdlp, track, dest, tmp_dir)
-        if not ok:
-            print("        FAILED: %s" % err, flush=True)
-            failed.append((label, query, err))
+        result = fetch_track(ytdlp, track, tmp_dir, seen_hashes)
+        if not result["ok"]:
+            print("        FAILED: %s" % result["error"], flush=True)
+            failed.append((label, result["query"], result["error"]))
             continue
+        shutil.move(result["path"], dest)
+        if result["hash"] is not None:
+            seen_hashes[result["hash"]] = label
+        checks.append((label, result["spotify_secs"], result["file_secs"]))
         try:
             tag_mp3(dest, track["title"], track["artist"], i)
         except Exception as exc:  # tagging is best-effort; the audio matters most
@@ -285,6 +468,18 @@ def main(argv=None):
             fh.write("DOWNLOADED\n")
             for label in downloaded:
                 fh.write("  %s\n" % label)
+            fh.write("\n")
+        if checks:
+            fh.write("CHECKS (spotify duration vs file duration)\n")
+            for label, spotify_secs, file_secs in checks:
+                if spotify_secs is not None and file_secs is not None:
+                    fh.write("  %s: spotify %.1fs vs file %.1fs\n"
+                             % (label, spotify_secs, file_secs))
+                elif file_secs is not None:
+                    fh.write("  %s: spotify duration unknown, file %.1fs\n"
+                             % (label, file_secs))
+                else:
+                    fh.write("  %s: duration could not be probed\n" % label)
             fh.write("\n")
         if skipped:
             fh.write("SKIPPED\n")
