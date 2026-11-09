@@ -58,6 +58,13 @@ Notes:
 - **Matching caveat:** each song is matched by a YouTube search for
   "Artist - Title". Obscure tracks occasionally match a live version or a
   cover — check `report.txt` and give the list a quick listen.
+- **Built-in guards:** every download is checked before it is tagged —
+  its real length must match Spotify's track length (within 8s / 4%),
+  its audio must not duplicate a song already fetched in the same run,
+  and if YouTube throws its "confirm you're not a bot" wall the download
+  retries through other player clients automatically. A song no
+  candidate passes for is reported as failed, never silently mis-tagged;
+  `report.txt` shows the Spotify-vs-file duration for every download.
 - **Liked Songs** aren't supported (Spotify's connector can't open the
   Liked Songs collection as a playlist). Workaround: put the songs in a
   regular playlist and point the tool at that.
